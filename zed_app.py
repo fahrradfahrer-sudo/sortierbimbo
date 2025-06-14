@@ -8,8 +8,8 @@ def main():
 
     # Create an InitParameters object and set configuration parameters
     init_params = sl.InitParameters()
-    init_params.camera_resolution = sl.RESOLUTION.HD720  # Use 720p resolution
-    init_params.camera_fps = 30  # Set FPS to 30
+    # init_params.camera_resolution = sl.RESOLUTION.HD720  # Use 720p resolution
+    # init_params.camera_fps = 30  # Set FPS to 30
     init_params.depth_mode = sl.DEPTH_MODE.PERFORMANCE  # Enable PERFORMANCE depth mode
     init_params.coordinate_units = sl.UNIT.METER # Use meters for depth units
 

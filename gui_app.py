@@ -5,7 +5,7 @@ import pyzed.sl as sl
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
                              QLabel, QFrame, QPushButton, QComboBox, QCheckBox, QScrollArea)
 from PyQt5.QtGui import QImage, QPixmap, QColor, QPalette
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, pyqtSlot
 
 class ZedCameraWorker(QThread):
     new_image_signal = pyqtSignal(QPixmap)

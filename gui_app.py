@@ -1,6 +1,6 @@
 import sys
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
-                             QLabel, QFrame, QPushButton, QComboBox, QCheckBox, QScrollArea)
+                             QLabel, QFrame, QPushButton, QComboBox, QCheckBox, QScrollArea, QSplitter)
 from PyQt5.QtGui import QImage, QPixmap, QColor, QPalette
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, pyqtSlot # Ensure pyqtSlot is imported
 import cv2
@@ -150,7 +150,7 @@ class ZedAppGUI(QMainWindow):
 
         main_widget = QWidget(self)
         self.setCentralWidget(main_widget)
-        main_layout = QHBoxLayout(main_widget)
+        # main_layout will be set later, after splitter is created
 
         # --- Left Panel (Controls) ---
         left_panel_frame = QFrame(self)
@@ -213,33 +213,50 @@ class ZedAppGUI(QMainWindow):
         scroll_area.setWidget(self.log_display)
         scroll_area.setFixedHeight(200) # Adjust as needed
         left_panel_layout.addWidget(scroll_area)
-        main_layout.addWidget(left_panel_frame, 1) # Relative width 1
+        # main_layout.addWidget(left_panel_frame, 1) # OLD way
 
         # --- Right Panel (Image and Depth Views) ---
         right_panel_frame = QFrame(self)
         right_panel_frame.setFrameShape(QFrame.StyledPanel)
-        right_panel_layout = QVBoxLayout(right_panel_frame)
 
-        self.image_label = QLabel("Camera Feed", right_panel_frame)
+        self.image_label = QLabel("Camera Feed", self) # Parent can be self initially
         self.image_label.setAlignment(Qt.AlignCenter)
-        self.image_label.setMinimumSize(640, 360)
+        self.image_label.setMinimumSize(640, 360) # Minimums are good, actual size by splitter
         self.image_label.setFrameShape(QFrame.Box)
         img_palette = self.image_label.palette()
         img_palette.setColor(QPalette.Window, QColor("black"))
         self.image_label.setPalette(img_palette)
         self.image_label.setAutoFillBackground(True)
-        right_panel_layout.addWidget(self.image_label, 2) # Relative height 2
+        # right_panel_layout.addWidget(self.image_label, 2) # This line was the problem, removed.
 
-        self.depth_label = QLabel("Depth Map", right_panel_frame)
+        self.depth_label = QLabel("Depth Map", self) # Parent can be self initially
         self.depth_label.setAlignment(Qt.AlignCenter)
-        self.depth_label.setMinimumSize(640, 180) # Adjusted for proportion
+        self.depth_label.setMinimumSize(640, 180)
         self.depth_label.setFrameShape(QFrame.Box)
         depth_palette = self.depth_label.palette()
         depth_palette.setColor(QPalette.Window, QColor("black"))
         self.depth_label.setPalette(depth_palette)
         self.depth_label.setAutoFillBackground(True)
-        right_panel_layout.addWidget(self.depth_label, 1) # Relative height 1
-        main_layout.addWidget(right_panel_frame, 3) # Relative width 3
+
+        # NEW: Vertical Splitter for Right Panel
+        right_v_splitter = QSplitter(Qt.Vertical)
+        right_v_splitter.addWidget(self.image_label)
+        right_v_splitter.addWidget(self.depth_label)
+        right_v_splitter.setSizes([450, 200])
+
+        new_right_panel_layout = QVBoxLayout(right_panel_frame)
+        new_right_panel_layout.addWidget(right_v_splitter)
+        right_panel_frame.setLayout(new_right_panel_layout)
+
+        # NEW: Main Horizontal Splitter
+        main_splitter = QSplitter(Qt.Horizontal)
+        main_splitter.addWidget(left_panel_frame)
+        main_splitter.addWidget(right_panel_frame)
+        main_splitter.setSizes([300, 850])
+
+        new_main_layout = QHBoxLayout(main_widget)
+        new_main_layout.addWidget(main_splitter)
+        main_widget.setLayout(new_main_layout)
 
         self.log_message("GUI Initialized. Settings configured for autostart.")
         self.show()

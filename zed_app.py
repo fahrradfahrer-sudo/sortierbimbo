@@ -8,9 +8,9 @@ def main():
 
     # Create an InitParameters object and set configuration parameters
     init_params = sl.InitParameters()
-    init_params.camera_resolution = sl.RESOLUTION.HD720  # Use 720p resolution
+    init_params.camera_resolution = sl.RESOLUTION.HD1200  # Use HD1200 resolution
     init_params.camera_fps = 30  # Set FPS to 30
-    init_params.depth_mode = sl.DEPTH_MODE.PERFORMANCE  # Enable PERFORMANCE depth mode
+    init_params.depth_mode = sl.DEPTH_MODE.NEURAL  # Use NEURAL depth mode
     init_params.coordinate_units = sl.UNIT.METER # Use meters for depth units
 
     # Open the camera
@@ -27,9 +27,10 @@ def main():
     # Create sl.Mat objects to store image and depth map
     image_sl = sl.Mat()
     depth_map_sl = sl.Mat()
+    # Depth confidence can be managed using runtime_parameters.confidence_threshold
+    # and runtime_parameters.texture_confidence_threshold.
+    # The confidence map itself can be retrieved using sl.MEASURE.CONFIDENCE.
     runtime_parameters = sl.RuntimeParameters()
-    # Enable depth confidence for potential filtering later, if needed
-    runtime_parameters.enable_depth_confidence = True
 
 
     while True:

@@ -82,9 +82,12 @@ class ZedCameraWorker(QThread):
 
                 self.log_message_signal.emit(f"Worker: image_for_qt shape: {{image_for_qt.shape if image_for_qt is not None else 'None'}}")
                 if image_for_qt is not None:
+                    # Ensure image_for_qt is C-contiguous (already done before this line if needed by previous operations)
+                    if not image_for_qt.flags.c_contiguous: # Double check, add if missing before
+                        image_for_qt = np.ascontiguousarray(image_for_qt)
                     h, w, ch = image_for_qt.shape
                     bytes_per_line = ch * w
-                    qt_image = QImage(image_for_qt.data, w, h, bytes_per_line, QImage.Format_RGB888).copy() # .copy() is important!
+                    qt_image = QImage(image_for_qt, w, h, bytes_per_line, QImage.Format_RGB888).copy() # Pass array directly
                     self.log_message_signal.emit(f"Worker: Emitting new_image_signal. qt_image.isNull(): {{qt_image.isNull()}}, size: {{qt_image.size()}}")
                     self.new_image_signal.emit(QPixmap.fromImage(qt_image))
 
@@ -104,9 +107,9 @@ class ZedCameraWorker(QThread):
 
                         # h_d, w_d were already defined from depth_map_normalized.shape
                         h_d, w_d = depth_map_normalized.shape
-                        if not depth_map_normalized.flags.c_contiguous:
+                        if not depth_map_normalized.flags.c_contiguous: # Ensure C-contiguous
                              depth_map_normalized = np.ascontiguousarray(depth_map_normalized)
-                        qt_depth_image = QImage(depth_map_normalized.data, w_d, h_d, w_d, QImage.Format_Grayscale8).copy()
+                        qt_depth_image = QImage(depth_map_normalized, w_d, h_d, w_d, QImage.Format_Grayscale8).copy() # Pass array directly
                         self.log_message_signal.emit(f"Worker: Emitting new_depth_signal (grayscale). qt_depth_image.isNull(): {{qt_depth_image.isNull()}}, size: {{qt_depth_image.size() if qt_depth_image else 'None'}}")
                         self.new_depth_signal.emit(QPixmap.fromImage(qt_depth_image))
                     else:

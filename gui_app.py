@@ -1,12 +1,15 @@
 import sys
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
-                             QLabel, QFrame, QPushButton, QComboBox, QScrollArea, QSplitter)
-from PyQt5.QtGui import QImage, QPixmap, QColor, QPalette, QPainter, QPen
+                             QLabel, QFrame, QPushButton, QComboBox, QScrollArea, QSplitter,
+                             QFileDialog, QSlider, QCheckBox, QGroupBox)
+from PyQt5.QtGui import QImage, QPixmap, QColor, QPalette, QPainter, QPen, QFont
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, pyqtSlot
 import cv2
 import numpy as np
 import pyzed.sl as sl
 from PIL import Image
+import os
+from datetime import datetime
 
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="torchvision")
@@ -59,6 +62,7 @@ class ZedCameraHandler(QThread):
     camera_stopped_signal = pyqtSignal()
     camera_started_successfully_signal = pyqtSignal()
     new_detections_signal = pyqtSignal(list)
+    new_counts_signal = pyqtSignal(dict)
 
     def __init__(self, parent=None, model_path: str = ""):
         super().__init__(parent)
@@ -67,6 +71,9 @@ class ZedCameraHandler(QThread):
         self.init_params = None
         self.model_path = model_path
         self.yolo_model = None
+        self.conf_threshold = 0.6
+        self.object_counts = {}
+        self.visible_objects = {}  # track_id -> label
 
     def start_camera(self, zed_sdk_params):
         self.init_params = zed_sdk_params
@@ -139,19 +146,34 @@ class ZedCameraHandler(QThread):
                     if not image_for_qt.flags.c_contiguous:
                         image_for_qt = np.ascontiguousarray(image_for_qt)
 
-                    # YOLO alle 3 Frames (Performance)
-                    frame_count += 1
-                    if self.yolo_model and frame_count % 3 == 0:
+                    # YOLO tracking every frame for better count accuracy
+                    if self.yolo_model:
                         try:
                             pil_image = Image.fromarray(image_for_qt)
-                            results = self.yolo_model.predict(
+                            # Use track instead of predict to get IDs
+                            results = self.yolo_model.track(
                                 source=pil_image,
+                                persist=True,
                                 verbose=False,
-                                conf=0.6,   # Höherer Schwellwert → weniger Boxen → schnellerer NMS
+                                conf=self.conf_threshold,
                                 device=0    # GPU
                             )
+
+                            current_frame_ids = set()
                             if results and results[0].boxes is not None:
                                 for box_data in results[0].boxes:
+                                    # Not all boxes might have a track ID if tracker is still warming up
+                                    if box_data.id is not None:
+                                        track_id = int(box_data.id[0])
+                                        class_id = int(box_data.cls[0])
+                                        label = self.yolo_model.names[class_id]
+
+                                        current_frame_ids.add(track_id)
+
+                                        # If it's a new object, start tracking it
+                                        if track_id not in self.visible_objects:
+                                            self.visible_objects[track_id] = label
+
                                     box_normalized = box_data.xyxyn[0].tolist()
                                     confidence = float(box_data.conf[0])
                                     class_id = int(box_data.cls[0])
@@ -162,6 +184,17 @@ class ZedCameraHandler(QThread):
                                         'class_id': class_id,
                                         'label': label
                                     })
+
+                            # Check for objects that disappeared
+                            disappeared_ids = set(self.visible_objects.keys()) - current_frame_ids
+                            if disappeared_ids:
+                                for d_id in disappeared_ids:
+                                    label = self.visible_objects.pop(d_id)
+                                    self.object_counts[label] = self.object_counts.get(label, 0) + 1
+                                    self.log_message_signal.emit(f"Counter: {label} disappeared. Total: {self.object_counts[label]}")
+
+                                self.new_counts_signal.emit(self.object_counts.copy())
+
                         except Exception as e:
                             self.log_message_signal.emit(f"Camera Handler: YOLO Fehler: {e}")
 
@@ -205,6 +238,14 @@ class ZedCameraHandler(QThread):
         self.log_message_signal.emit("Camera Handler: Stop angefordert.")
         self.running = False
 
+    def update_conf_threshold(self, threshold):
+        self.conf_threshold = threshold
+
+    def reset_counter(self):
+        self.object_counts = {}
+        self.visible_objects = {}
+        self.new_counts_signal.emit(self.object_counts.copy())
+
 
 class ZedAppGUI(QMainWindow):
     def __init__(self):
@@ -217,8 +258,8 @@ class ZedAppGUI(QMainWindow):
         self.current_fps_val = 30
         self.current_depth_mode_enum = sl.DEPTH_MODE.NEURAL
 
-        # ── Modellpfad hier anpassen ─────────────────────────────────────────
-        self.model_path_placeholder = (
+        # ── Modellpfad ───────────────────────────────────────────────────────
+        self.model_path = (
             "/home/matthias/sortierbimbo/testmodell_facenet/"
             "Face-Recognition-using-YoloV8-and-FaceNet-main/detection/weights/best.engine"
         )
@@ -228,7 +269,21 @@ class ZedAppGUI(QMainWindow):
         self.pending_settings_change = False
         self.camera_handler = None
         self.last_image_pixmap = None
+        self.last_depth_pixmap = None
         self.last_detections = []   # Letzte bekannte Detektionen (bleibt bei Timeout erhalten)
+
+        # Photo settings
+        self.save_directory = os.path.expanduser("~")
+        self.save_annotated = True
+        self.save_depth = False
+
+        # Detection settings
+        self.conf_threshold = 0.6
+        self.show_boxes = True
+        self.show_labels = True
+
+        # Counter
+        self.object_counts = {}
 
         # ── UI ───────────────────────────────────────────────────────────────
         main_widget = QWidget(self)
@@ -276,6 +331,84 @@ class ZedAppGUI(QMainWindow):
         self.apply_settings_button = QPushButton("Apply Settings", left_panel_frame)
         self.apply_settings_button.clicked.connect(self.apply_settings)
         left_panel_layout.addWidget(self.apply_settings_button)
+
+        # --- Model Selection ---
+        model_group = QGroupBox("YOLO Model")
+        model_layout = QVBoxLayout()
+        self.model_label = QLabel(os.path.basename(self.model_path))
+        self.model_label.setWordWrap(True)
+        self.select_model_button = QPushButton("Select Model")
+        self.select_model_button.clicked.connect(self.select_model)
+        model_layout.addWidget(self.model_label)
+        model_layout.addWidget(self.select_model_button)
+        model_group.setLayout(model_layout)
+        left_panel_layout.addWidget(model_group)
+
+        # --- Photo Section ---
+        photo_group = QGroupBox("Photo Settings")
+        photo_layout = QVBoxLayout()
+        self.photo_dir_label = QLabel(f"Dir: {os.path.basename(self.save_directory)}")
+        self.set_dir_button = QPushButton("Set Save Directory")
+        self.set_dir_button.clicked.connect(self.set_save_directory)
+        self.take_photo_button = QPushButton("TAKE PHOTO")
+        self.take_photo_button.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; height: 40px;")
+        self.take_photo_button.clicked.connect(self.take_photo)
+
+        self.save_annotated_cb = QCheckBox("Save with Annotations")
+        self.save_annotated_cb.setChecked(self.save_annotated)
+        self.save_annotated_cb.stateChanged.connect(self.toggle_save_annotated)
+
+        self.save_depth_cb = QCheckBox("Save Depth Map")
+        self.save_depth_cb.setChecked(self.save_depth)
+        self.save_depth_cb.stateChanged.connect(self.toggle_save_depth)
+
+        photo_layout.addWidget(self.photo_dir_label)
+        photo_layout.addWidget(self.set_dir_button)
+        photo_layout.addWidget(self.save_annotated_cb)
+        photo_layout.addWidget(self.save_depth_cb)
+        photo_layout.addWidget(self.take_photo_button)
+        photo_group.setLayout(photo_layout)
+        left_panel_layout.addWidget(photo_group)
+
+        # --- Detection Settings ---
+        detect_group = QGroupBox("Detection Settings")
+        detect_layout = QVBoxLayout()
+
+        detect_layout.addWidget(QLabel("Confidence Threshold:"))
+        self.conf_slider = QSlider(Qt.Horizontal)
+        self.conf_slider.setMinimum(0)
+        self.conf_slider.setMaximum(100)
+        self.conf_slider.setValue(int(self.conf_threshold * 100))
+        self.conf_slider.valueChanged.connect(self.update_conf_threshold)
+        self.conf_val_label = QLabel(f"{self.conf_threshold:.2f}")
+        detect_layout.addWidget(self.conf_slider)
+        detect_layout.addWidget(self.conf_val_label)
+
+        self.show_boxes_cb = QCheckBox("Show Bounding Boxes")
+        self.show_boxes_cb.setChecked(self.show_boxes)
+        self.show_boxes_cb.stateChanged.connect(self.toggle_show_boxes)
+
+        self.show_labels_cb = QCheckBox("Show Labels")
+        self.show_labels_cb.setChecked(self.show_labels)
+        self.show_labels_cb.stateChanged.connect(self.toggle_show_labels)
+
+        detect_layout.addWidget(self.show_boxes_cb)
+        detect_layout.addWidget(self.show_labels_cb)
+        detect_group.setLayout(detect_layout)
+        left_panel_layout.addWidget(detect_group)
+
+        # --- Counter Section ---
+        counter_group = QGroupBox("Object Counter")
+        counter_layout = QVBoxLayout()
+        self.counter_label = QLabel("No items detected yet.")
+        self.counter_label.setStyleSheet("font-size: 14px; font-weight: bold;")
+        self.reset_counter_button = QPushButton("Reset Counter")
+        self.reset_counter_button.clicked.connect(self.reset_counter)
+        counter_layout.addWidget(self.counter_label)
+        counter_layout.addWidget(self.reset_counter_button)
+        counter_group.setLayout(counter_layout)
+        left_panel_layout.addWidget(counter_group)
+
         left_panel_layout.addStretch(1)
 
         left_panel_layout.addWidget(QLabel("Camera Logs:", left_panel_frame))
@@ -332,9 +465,101 @@ class ZedAppGUI(QMainWindow):
 
         # ── Start ─────────────────────────────────────────────────────────────
         self.log_message("GUI: Kartoffelsortierer gestartet.")
-        self.log_message(f"GUI: Modell: {self.model_path_placeholder}")
+        self.log_message(f"GUI: Modell: {self.model_path}")
         self.show()
         self.start_camera_with_current_settings()
+
+    # --- UI Handlers ---
+    def select_model(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select YOLO Model", "", "Model Files (*.pt *.engine *.onnx);;All Files (*)")
+        if file_path:
+            self.model_path = file_path
+            self.model_label.setText(os.path.basename(file_path))
+            self.log_message(f"GUI: Model selected: {file_path}. Click 'Apply Settings' to load.")
+
+    def set_save_directory(self):
+        dir_path = QFileDialog.getExistingDirectory(self, "Select Save Directory", self.save_directory)
+        if dir_path:
+            self.save_directory = dir_path
+            self.photo_dir_label.setText(f"Dir: {os.path.basename(dir_path)}")
+            self.log_message(f"GUI: Save directory set to: {dir_path}")
+
+    def toggle_save_annotated(self, state):
+        self.save_annotated = (state == Qt.Checked)
+
+    def toggle_save_depth(self, state):
+        self.save_depth = (state == Qt.Checked)
+
+    def update_conf_threshold(self, value):
+        self.conf_threshold = value / 100.0
+        self.conf_val_label.setText(f"{self.conf_threshold:.2f}")
+        if self.camera_handler:
+            self.camera_handler.update_conf_threshold(self.conf_threshold)
+
+    def toggle_show_boxes(self, state):
+        self.show_boxes = (state == Qt.Checked)
+
+    def toggle_show_labels(self, state):
+        self.show_labels = (state == Qt.Checked)
+
+    def take_photo(self):
+        if self.last_image_pixmap is None or self.last_image_pixmap.isNull():
+            self.log_message("GUI Error: No image to save.")
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # 1. Save annotated or raw image
+        # We always start from the full-resolution last_image_pixmap
+        image_to_save = self.last_image_pixmap.copy()
+
+        if self.save_annotated and self.last_detections:
+            painter = QPainter(image_to_save)
+            pen = QPen(QColor(0, 255, 0), 3)
+            painter.setPen(pen)
+            font = QFont("Arial", 12)
+            painter.setFont(font)
+            w = image_to_save.width()
+            h = image_to_save.height()
+            for det in self.last_detections:
+                x1n, y1n, x2n, y2n = det['box_xyxyn']
+                x1, y1 = int(x1n * w), int(y1n * h)
+                x2, y2 = int(x2n * w), int(y2n * h)
+                # In photos, we always save both boxes and labels if annotated is checked
+                painter.drawRect(x1, y1, x2 - x1, y2 - y1)
+                painter.drawText(x1, max(y1 - 4, 14), f"{det['label']} {det['confidence']:.2f}")
+            painter.end()
+
+        filename = f"photo_{timestamp}.jpg"
+        filepath = os.path.join(self.save_directory, filename)
+        image_to_save.save(filepath, "JPG")
+        self.log_message(f"GUI: Photo saved to {filepath}")
+
+        # 2. Save depth map if requested
+        if self.save_depth and self.last_depth_pixmap and not self.last_depth_pixmap.isNull():
+            depth_filename = f"depth_{timestamp}.png"
+            depth_filepath = os.path.join(self.save_directory, depth_filename)
+            self.last_depth_pixmap.save(depth_filepath, "PNG")
+            self.log_message(f"GUI: Depth map saved to {depth_filepath}")
+
+    def reset_counter(self):
+        self.object_counts = {}
+        self.counter_label.setText("No items detected yet.")
+        if self.camera_handler:
+            self.camera_handler.reset_counter()
+        self.log_message("GUI: Counter reset.")
+
+    @pyqtSlot(dict)
+    def update_counter_display(self, counts):
+        self.object_counts = counts
+        if not counts:
+            self.counter_label.setText("No items detected yet.")
+            return
+
+        text = "Detected items:\n"
+        for label, count in counts.items():
+            text += f"- {label}: {count}\n"
+        self.counter_label.setText(text.strip())
 
     # ── Kamerasteuerung ───────────────────────────────────────────────────────
 
@@ -377,16 +602,19 @@ class ZedAppGUI(QMainWindow):
                 self.camera_handler.camera_stopped_signal.disconnect()
                 self.camera_handler.camera_started_successfully_signal.disconnect()
                 self.camera_handler.new_detections_signal.disconnect()
+                self.camera_handler.new_counts_signal.disconnect()
             except Exception:
                 pass
 
-        self.camera_handler = ZedCameraHandler(self, model_path=self.model_path_placeholder)
+        self.camera_handler = ZedCameraHandler(self, model_path=self.model_path)
+        self.camera_handler.conf_threshold = self.conf_threshold
         self.camera_handler.new_image_signal.connect(self.update_image_label)
         self.camera_handler.new_depth_signal.connect(self.update_depth_label)
         self.camera_handler.log_message_signal.connect(self.log_message)
         self.camera_handler.camera_stopped_signal.connect(self.on_camera_handler_stopped)
         self.camera_handler.camera_started_successfully_signal.connect(self.on_camera_handler_started_successfully)
         self.camera_handler.new_detections_signal.connect(self.on_new_detections)
+        self.camera_handler.new_counts_signal.connect(self.update_counter_display)
         self.camera_handler.start_camera(zed_sdk_params)
 
     # ── Slots ─────────────────────────────────────────────────────────────────
@@ -418,7 +646,7 @@ class ZedAppGUI(QMainWindow):
             return
         self.last_image_pixmap = pixmap
 
-        if self.last_detections:
+        if self.last_detections and (self.show_boxes or self.show_labels):
             draw_pixmap = pixmap.copy()
             painter = QPainter(draw_pixmap)
             pen = QPen(QColor(0, 255, 0), 3)
@@ -429,8 +657,10 @@ class ZedAppGUI(QMainWindow):
                 x1n, y1n, x2n, y2n = det['box_xyxyn']
                 x1, y1 = int(x1n * w), int(y1n * h)
                 x2, y2 = int(x2n * w), int(y2n * h)
-                painter.drawRect(x1, y1, x2 - x1, y2 - y1)
-                painter.drawText(x1, max(y1 - 4, 14), f"{det['label']} {det['confidence']:.2f}")
+                if self.show_boxes:
+                    painter.drawRect(x1, y1, x2 - x1, y2 - y1)
+                if self.show_labels:
+                    painter.drawText(x1, max(y1 - 4, 14), f"{det['label']} {det['confidence']:.2f}")
             painter.end()
             self.image_label.setPixmap(
                 draw_pixmap.scaled(self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
@@ -443,6 +673,7 @@ class ZedAppGUI(QMainWindow):
     @pyqtSlot(QPixmap)
     def update_depth_label(self, pixmap):
         if not pixmap.isNull():
+            self.last_depth_pixmap = pixmap
             self.depth_label.setPixmap(
                 pixmap.scaled(self.depth_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
             )

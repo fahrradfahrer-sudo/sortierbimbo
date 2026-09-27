@@ -156,7 +156,7 @@ class ZedCameraHandler(QThread):
         self.yolo_model = None
         self.conf_threshold = 0.6
         self.object_counts = {}
-        self.visible_objects = {}  # track_id -> label
+        self.seen_track_ids = set()  # set of track_ids already counted
         self._last_logged_yolo_error = None
         self._yolo_error_count = 0
 
@@ -280,7 +280,7 @@ class ZedCameraHandler(QThread):
                                     device=0    # GPU
                                 )
 
-                            current_frame_ids = set()
+                            new_count_detected = False
                             if results and len(results) > 0 and results[0].boxes is not None:
                                 res_obj = results[0]
                                 for box_data in res_obj.boxes:
@@ -290,11 +290,13 @@ class ZedCameraHandler(QThread):
                                     # Not all boxes might have a track ID if tracker is still warming up or in predict fallback
                                     if getattr(box_data, 'id', None) is not None:
                                         track_id = int(box_data.id[0])
-                                        current_frame_ids.add(track_id)
 
-                                        # If it's a new object, start tracking it
-                                        if track_id not in self.visible_objects:
-                                            self.visible_objects[track_id] = label
+                                        # Count object once per unique track ID upon first detection
+                                        if track_id not in self.seen_track_ids:
+                                            self.seen_track_ids.add(track_id)
+                                            self.object_counts[label] = self.object_counts.get(label, 0) + 1
+                                            self.log_message_signal.emit(f"Counter: New {label} detected (ID: {track_id}). Total {label}: {self.object_counts[label]}")
+                                            new_count_detected = True
 
                                     box_normalized = box_data.xyxyn[0].tolist()
                                     confidence = float(box_data.conf[0])
@@ -305,14 +307,7 @@ class ZedCameraHandler(QThread):
                                         'label': label
                                     })
 
-                            # Check for objects that disappeared
-                            disappeared_ids = set(self.visible_objects.keys()) - current_frame_ids
-                            if disappeared_ids:
-                                for d_id in disappeared_ids:
-                                    label = self.visible_objects.pop(d_id)
-                                    self.object_counts[label] = self.object_counts.get(label, 0) + 1
-                                    self.log_message_signal.emit(f"Counter: {label} disappeared. Total: {self.object_counts[label]}")
-
+                            if new_count_detected:
                                 self.new_counts_signal.emit(self.object_counts.copy())
 
                         except Exception as e:
@@ -371,7 +366,7 @@ class ZedCameraHandler(QThread):
 
     def reset_counter(self):
         self.object_counts = {}
-        self.visible_objects = {}
+        self.seen_track_ids = set()
         self.new_counts_signal.emit(self.object_counts.copy())
 
 

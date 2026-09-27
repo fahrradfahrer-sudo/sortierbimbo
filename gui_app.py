@@ -160,6 +160,21 @@ class ZedCameraHandler(QThread):
         self._last_logged_yolo_error = None
         self._yolo_error_count = 0
 
+    def _get_class_name(self, class_id: int, result_obj=None) -> str:
+        if self.yolo_model and getattr(self.yolo_model, 'names', None) is not None:
+            names = self.yolo_model.names
+            if isinstance(names, dict) and class_id in names:
+                return str(names[class_id])
+            elif isinstance(names, (list, tuple)) and 0 <= class_id < len(names):
+                return str(names[class_id])
+        if result_obj is not None and getattr(result_obj, 'names', None) is not None:
+            names = result_obj.names
+            if isinstance(names, dict) and class_id in names:
+                return str(names[class_id])
+            elif isinstance(names, (list, tuple)) and 0 <= class_id < len(names):
+                return str(names[class_id])
+        return "face" if class_id == 0 else f"class_{class_id}"
+
     def start_camera(self, zed_sdk_params):
         self.init_params = zed_sdk_params
         self.log_message_signal.emit(
@@ -196,7 +211,7 @@ class ZedCameraHandler(QThread):
 
         if self.model_path:
             try:
-                self.yolo_model = YOLO(self.model_path)
+                self.yolo_model = YOLO(self.model_path, task='detect')
                 self.log_message_signal.emit(f"Camera Handler: YOLO geladen: {self.model_path}")
             except Exception as e:
                 self.log_message_signal.emit(f"Camera Handler: YOLO Fehler beim Laden des Modells ({self.model_path}): {e}")
@@ -205,7 +220,7 @@ class ZedCameraHandler(QThread):
                 if self.model_path.endswith(".engine") and os.path.exists(fallback_pt):
                     self.log_message_signal.emit(f"Camera Handler: Versuche Fallback-Modell zu laden: {fallback_pt}")
                     try:
-                        self.yolo_model = YOLO(fallback_pt)
+                        self.yolo_model = YOLO(fallback_pt, task='detect')
                         self.log_message_signal.emit(f"Camera Handler: Fallback-Modell erfolgreich geladen: {fallback_pt}")
                     except Exception as fe:
                         self.log_message_signal.emit(f"Camera Handler: Fallback-Modell Fehler: {fe}")
@@ -242,28 +257,39 @@ class ZedCameraHandler(QThread):
                     if not image_for_qt.flags.c_contiguous:
                         image_for_qt = np.ascontiguousarray(image_for_qt)
 
-                    # YOLO tracking every frame for better count accuracy
+                    # YOLO tracking / prediction every frame
                     if self.yolo_model:
                         try:
                             pil_image = Image.fromarray(image_for_qt)
-                            # Use track instead of predict to get IDs
-                            results = self.yolo_model.track(
-                                source=pil_image,
-                                persist=True,
-                                verbose=False,
-                                conf=self.conf_threshold,
-                                device=0    # GPU
-                            )
+                            results = None
+                            try:
+                                # First attempt track for IDs
+                                results = self.yolo_model.track(
+                                    source=pil_image,
+                                    persist=True,
+                                    verbose=False,
+                                    conf=self.conf_threshold,
+                                    device=0    # GPU
+                                )
+                            except Exception as track_err:
+                                # Fallback to predict if tracking fails
+                                results = self.yolo_model.predict(
+                                    source=pil_image,
+                                    verbose=False,
+                                    conf=self.conf_threshold,
+                                    device=0    # GPU
+                                )
 
                             current_frame_ids = set()
-                            if results and results[0].boxes is not None:
-                                for box_data in results[0].boxes:
-                                    # Not all boxes might have a track ID if tracker is still warming up
-                                    if box_data.id is not None:
-                                        track_id = int(box_data.id[0])
-                                        class_id = int(box_data.cls[0])
-                                        label = self.yolo_model.names[class_id]
+                            if results and len(results) > 0 and results[0].boxes is not None:
+                                res_obj = results[0]
+                                for box_data in res_obj.boxes:
+                                    class_id = int(box_data.cls[0])
+                                    label = self._get_class_name(class_id, result_obj=res_obj)
 
+                                    # Not all boxes might have a track ID if tracker is still warming up or in predict fallback
+                                    if getattr(box_data, 'id', None) is not None:
+                                        track_id = int(box_data.id[0])
                                         current_frame_ids.add(track_id)
 
                                         # If it's a new object, start tracking it
@@ -272,8 +298,6 @@ class ZedCameraHandler(QThread):
 
                                     box_normalized = box_data.xyxyn[0].tolist()
                                     confidence = float(box_data.conf[0])
-                                    class_id = int(box_data.cls[0])
-                                    label = self.yolo_model.names[class_id]
                                     detections_list.append({
                                         'box_xyxyn': box_normalized,
                                         'confidence': confidence,

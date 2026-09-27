@@ -48,6 +48,89 @@ try:
     _tvops.nms = _nms_pure_torch
 except Exception as _e:
     print(f"NMS-Patch Warnung: {_e}")
+
+# ── TensorRT 10 Compatibility Patch ──────────────────────────────────────────
+try:
+    import tensorrt as trt
+    if hasattr(trt, "ICudaEngine"):
+        if not hasattr(trt.ICudaEngine, "num_bindings"):
+            def _num_bindings(self):
+                return getattr(self, "num_io_tensors", 0)
+
+            def _get_binding_name(self, index):
+                if hasattr(self, "get_tensor_name"):
+                    return self.get_tensor_name(index)
+                return f"binding_{index}"
+
+            def _binding_is_input(self, index_or_name):
+                if isinstance(index_or_name, int) and hasattr(self, "get_tensor_name"):
+                    name = self.get_tensor_name(index_or_name)
+                else:
+                    name = index_or_name
+                if hasattr(self, "get_tensor_mode") and hasattr(trt, "TensorIOMode"):
+                    return self.get_tensor_mode(name) == trt.TensorIOMode.INPUT
+                return False
+
+            def _get_binding_shape(self, index_or_name):
+                if isinstance(index_or_name, int) and hasattr(self, "get_tensor_name"):
+                    name = self.get_tensor_name(index_or_name)
+                else:
+                    name = index_or_name
+                if hasattr(self, "get_tensor_shape"):
+                    return self.get_tensor_shape(name)
+                return ()
+
+            def _get_binding_dtype(self, index_or_name):
+                if isinstance(index_or_name, int) and hasattr(self, "get_tensor_name"):
+                    name = self.get_tensor_name(index_or_name)
+                else:
+                    name = index_or_name
+                if hasattr(self, "get_tensor_dtype"):
+                    return self.get_tensor_dtype(name)
+                return None
+
+            trt.ICudaEngine.num_bindings = property(_num_bindings)
+            trt.ICudaEngine.get_binding_name = _get_binding_name
+            trt.ICudaEngine.binding_is_input = _binding_is_input
+            trt.ICudaEngine.get_binding_shape = _get_binding_shape
+            trt.ICudaEngine.get_binding_dtype = _get_binding_dtype
+
+    if hasattr(trt, "IExecutionContext"):
+        if not hasattr(trt.IExecutionContext, "set_binding_shape"):
+            def _set_binding_shape(self, index_or_name, shape):
+                engine = self.engine
+                if isinstance(index_or_name, int) and hasattr(engine, "get_tensor_name"):
+                    name = engine.get_tensor_name(index_or_name)
+                else:
+                    name = str(index_or_name)
+                if hasattr(self, "set_input_shape"):
+                    return self.set_input_shape(name, shape)
+                return False
+
+            trt.IExecutionContext.set_binding_shape = _set_binding_shape
+
+        if not hasattr(trt.IExecutionContext, "get_binding_shape"):
+            def _get_binding_shape(self, index_or_name):
+                engine = self.engine
+                if isinstance(index_or_name, int) and hasattr(engine, "get_tensor_name"):
+                    name = engine.get_tensor_name(index_or_name)
+                else:
+                    name = str(index_or_name)
+                if hasattr(self, "get_tensor_shape"):
+                    return self.get_tensor_shape(name)
+                return ()
+
+            trt.IExecutionContext.get_binding_shape = _get_binding_shape
+
+        if not hasattr(trt.IExecutionContext, "all_binding_shapes_bound"):
+            def _all_binding_shapes_bound(self):
+                if hasattr(self, "all_model_inputs_specified"):
+                    return self.all_model_inputs_specified
+                return True
+
+            trt.IExecutionContext.all_binding_shapes_bound = property(_all_binding_shapes_bound)
+except Exception as _trt_e:
+    print(f"TensorRT-Patch Warnung: {_trt_e}")
 # ─────────────────────────────────────────────────────────────────────────────
 
 from ultralytics import YOLO
@@ -74,6 +157,8 @@ class ZedCameraHandler(QThread):
         self.conf_threshold = 0.6
         self.object_counts = {}
         self.visible_objects = {}  # track_id -> label
+        self._last_logged_yolo_error = None
+        self._yolo_error_count = 0
 
     def start_camera(self, zed_sdk_params):
         self.init_params = zed_sdk_params
@@ -114,8 +199,19 @@ class ZedCameraHandler(QThread):
                 self.yolo_model = YOLO(self.model_path)
                 self.log_message_signal.emit(f"Camera Handler: YOLO geladen: {self.model_path}")
             except Exception as e:
-                self.log_message_signal.emit(f"Camera Handler: YOLO Fehler: {e}")
-                self.yolo_model = None
+                self.log_message_signal.emit(f"Camera Handler: YOLO Fehler beim Laden des Modells ({self.model_path}): {e}")
+                base_no_ext = os.path.splitext(self.model_path)[0]
+                fallback_pt = base_no_ext + ".pt"
+                if self.model_path.endswith(".engine") and os.path.exists(fallback_pt):
+                    self.log_message_signal.emit(f"Camera Handler: Versuche Fallback-Modell zu laden: {fallback_pt}")
+                    try:
+                        self.yolo_model = YOLO(fallback_pt)
+                        self.log_message_signal.emit(f"Camera Handler: Fallback-Modell erfolgreich geladen: {fallback_pt}")
+                    except Exception as fe:
+                        self.log_message_signal.emit(f"Camera Handler: Fallback-Modell Fehler: {fe}")
+                        self.yolo_model = None
+                else:
+                    self.yolo_model = None
         else:
             self.log_message_signal.emit("Camera Handler: Kein Modellpfad angegeben.")
 
@@ -196,7 +292,15 @@ class ZedCameraHandler(QThread):
                                 self.new_counts_signal.emit(self.object_counts.copy())
 
                         except Exception as e:
-                            self.log_message_signal.emit(f"Camera Handler: YOLO Fehler: {e}")
+                            err_str = str(e)
+                            if err_str != self._last_logged_yolo_error:
+                                self._last_logged_yolo_error = err_str
+                                self._yolo_error_count = 1
+                                self.log_message_signal.emit(f"Camera Handler: YOLO Fehler: {e}")
+                            else:
+                                self._yolo_error_count += 1
+                                if self._yolo_error_count % 100 == 0:
+                                    self.log_message_signal.emit(f"Camera Handler: YOLO Fehler weiterhin vorhanden ({self._yolo_error_count} mal): {e}")
 
                     # Nur senden wenn neue Detektionen vorhanden
                     if detections_list:

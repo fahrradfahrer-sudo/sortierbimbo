@@ -10,6 +10,8 @@ import pyzed.sl as sl
 from PIL import Image
 import os
 from datetime import datetime
+import time
+import math
 
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="torchvision")
@@ -155,10 +157,72 @@ class ZedCameraHandler(QThread):
         self.model_path = model_path
         self.yolo_model = None
         self.conf_threshold = 0.6
+        self.retention_time_sec = 3.0
+        self.distance_threshold_cm = 30.0
         self.object_counts = {}
         self.seen_track_ids = set()  # set of track_ids already counted
+        self.active_tracks = {}      # canonical_id -> list of {'t', 'pos_3d', 'pos_2d', 'label'}
+        self.lost_tracks = {}        # lost_id -> {'last_t', 'last_pos_3d', 'v_3d', 'last_pos_2d', 'v_2d', 'label', 'canonical_id'}
+        self.track_id_aliases = {}   # raw_track_id -> canonical_id
         self._last_logged_yolo_error = None
         self._yolo_error_count = 0
+
+    def update_retention_time(self, time_sec: float):
+        self.retention_time_sec = float(time_sec)
+
+    def update_distance_threshold(self, dist_cm: float):
+        self.distance_threshold_cm = float(dist_cm)
+
+    def _get_3d_pos(self, x1n, y1n, x2n, y2n, depth_map_ocv, img_w, img_h, fx, fy, cx_cam, cy_cam):
+        if depth_map_ocv is None or depth_map_ocv.size == 0 or fx is None or fy is None:
+            return None
+        cx_px = int(round((x1n + x2n) / 2.0 * img_w))
+        cy_px = int(round((y1n + y2n) / 2.0 * img_h))
+        cx_px = max(0, min(img_w - 1, cx_px))
+        cy_px = max(0, min(img_h - 1, cy_px))
+
+        half_k = 2
+        r_min = max(0, cy_px - half_k)
+        r_max = min(img_h, cy_px + half_k + 1)
+        c_min = max(0, cx_px - half_k)
+        c_max = min(img_w, cx_px + half_k + 1)
+
+        roi = depth_map_ocv[r_min:r_max, c_min:c_max]
+        valid_depths = roi[(~np.isnan(roi)) & (~np.isinf(roi)) & (roi > 0.1) & (roi < 20.0)]
+        if valid_depths.size == 0:
+            return None
+        z_m = float(np.median(valid_depths))
+        x_m = (cx_px - cx_cam) * z_m / fx
+        y_m = (cy_px - cy_cam) * z_m / fy
+        return (x_m, y_m, z_m)
+
+    def _calc_velocity(self, history):
+        if len(history) < 2:
+            return (0.0, 0.0, 0.0), (0.0, 0.0)
+        t_first = history[0]['t']
+        t_last = history[-1]['t']
+        dt = t_last - t_first
+        if dt < 0.02:
+            return (0.0, 0.0, 0.0), (0.0, 0.0)
+
+        p3d_first = history[0]['pos_3d']
+        p3d_last = history[-1]['pos_3d']
+        if p3d_first is not None and p3d_last is not None:
+            v3d = (
+                (p3d_last[0] - p3d_first[0]) / dt,
+                (p3d_last[1] - p3d_first[1]) / dt,
+                (p3d_last[2] - p3d_first[2]) / dt,
+            )
+        else:
+            v3d = (0.0, 0.0, 0.0)
+
+        p2d_first = history[0]['pos_2d']
+        p2d_last = history[-1]['pos_2d']
+        v2d = (
+            (p2d_last[0] - p2d_first[0]) / dt,
+            (p2d_last[1] - p2d_first[1]) / dt,
+        )
+        return v3d, v2d
 
     def _get_class_name(self, class_id: int, result_obj=None) -> str:
         if self.yolo_model and getattr(self.yolo_model, 'names', None) is not None:
@@ -209,6 +273,15 @@ class ZedCameraHandler(QThread):
         self.log_message_signal.emit("Camera Handler: Kamera geöffnet.")
         self.camera_started_successfully_signal.emit()
 
+        cam_fx, cam_fy, cam_cx, cam_cy = None, None, None, None
+        try:
+            cam_info = self.zed.get_camera_information()
+            calib = cam_info.camera_configuration.calibration_parameters.left_cam
+            cam_fx, cam_fy = calib.fx, calib.fy
+            cam_cx, cam_cy = calib.cx, calib.cy
+        except Exception as calib_e:
+            self.log_message_signal.emit(f"Camera Handler: Kalibrierungsdaten nicht geladen: {calib_e}")
+
         if self.model_path:
             try:
                 self.yolo_model = YOLO(self.model_path, task='detect')
@@ -253,9 +326,23 @@ class ZedCameraHandler(QThread):
                 else:
                     continue
 
+                # Tiefenkarte vorab abrufen
+                depth_map_ocv = None
+                if self.init_params.depth_mode != sl.DEPTH_MODE.NONE:
+                    self.zed.retrieve_measure(depth_map_sl, sl.MEASURE.DEPTH)
+                    depth_map_ocv = depth_map_sl.get_data()
+
                 if image_for_qt is not None:
                     if not image_for_qt.flags.c_contiguous:
                         image_for_qt = np.ascontiguousarray(image_for_qt)
+
+                    t_now = time.time()
+                    current_frame_canonical_ids = set()
+
+                    # Stale lost tracks bereinigen
+                    stale_lost = [lid for lid, linfo in self.lost_tracks.items() if (t_now - linfo['last_t']) > self.retention_time_sec]
+                    for lid in stale_lost:
+                        del self.lost_tracks[lid]
 
                     # YOLO tracking / prediction every frame
                     if self.yolo_model:
@@ -281,31 +368,120 @@ class ZedCameraHandler(QThread):
                                 )
 
                             new_count_detected = False
+                            img_h, img_w = image_for_qt.shape[:2]
+
                             if results and len(results) > 0 and results[0].boxes is not None:
                                 res_obj = results[0]
                                 for box_data in res_obj.boxes:
                                     class_id = int(box_data.cls[0])
                                     label = self._get_class_name(class_id, result_obj=res_obj)
 
-                                    # Not all boxes might have a track ID if tracker is still warming up or in predict fallback
+                                    raw_track_id = None
                                     if getattr(box_data, 'id', None) is not None:
-                                        track_id = int(box_data.id[0])
-
-                                        # Count object once per unique track ID upon first detection
-                                        if track_id not in self.seen_track_ids:
-                                            self.seen_track_ids.add(track_id)
-                                            self.object_counts[label] = self.object_counts.get(label, 0) + 1
-                                            self.log_message_signal.emit(f"Counter: New {label} detected (ID: {track_id}). Total {label}: {self.object_counts[label]}")
-                                            new_count_detected = True
+                                        raw_track_id = int(box_data.id[0])
 
                                     box_normalized = box_data.xyxyn[0].tolist()
+                                    x1n, y1n, x2n, y2n = box_normalized
                                     confidence = float(box_data.conf[0])
+
+                                    pos_2d = ((x1n + x2n) / 2.0, (y1n + y2n) / 2.0)
+                                    pos_3d = self._get_3d_pos(x1n, y1n, x2n, y2n, depth_map_ocv, img_w, img_h, cam_fx, cam_fy, cam_cx, cam_cy)
+
+                                    if raw_track_id is not None:
+                                        canonical_id = self.track_id_aliases.get(raw_track_id, raw_track_id)
+
+                                        if canonical_id in self.seen_track_ids or raw_track_id in self.seen_track_ids:
+                                            if canonical_id in self.lost_tracks:
+                                                del self.lost_tracks[canonical_id]
+                                        else:
+                                            # Prüfe auf Wiedererscheinen in lost_tracks
+                                            best_match_id = None
+                                            best_dist_cm = float('inf')
+
+                                            for lost_id, linfo in list(self.lost_tracks.items()):
+                                                dt = t_now - linfo['last_t']
+                                                if dt <= self.retention_time_sec:
+                                                    if pos_3d is not None and linfo['last_pos_3d'] is not None:
+                                                        pred_x = linfo['last_pos_3d'][0] + linfo['v_3d'][0] * dt
+                                                        pred_y = linfo['last_pos_3d'][1] + linfo['v_3d'][1] * dt
+                                                        pred_z = linfo['last_pos_3d'][2] + linfo['v_3d'][2] * dt
+                                                        dist_m = math.sqrt(
+                                                            (pos_3d[0] - pred_x) ** 2 +
+                                                            (pos_3d[1] - pred_y) ** 2 +
+                                                            (pos_3d[2] - pred_z) ** 2
+                                                        )
+                                                        dist_cm = dist_m * 100.0
+                                                    else:
+                                                        pred_cx = linfo['last_pos_2d'][0] + linfo['v_2d'][0] * dt
+                                                        pred_cy = linfo['last_pos_2d'][1] + linfo['v_2d'][1] * dt
+                                                        dist_norm = math.sqrt(
+                                                            (pos_2d[0] - pred_cx) ** 2 +
+                                                            (pos_2d[1] - pred_cy) ** 2
+                                                        )
+                                                        dist_cm = dist_norm * 200.0
+
+                                                    if dist_cm <= self.distance_threshold_cm and dist_cm < best_dist_cm:
+                                                        best_dist_cm = dist_cm
+                                                        best_match_id = lost_id
+
+                                            if best_match_id is not None:
+                                                canonical_id = best_match_id
+                                                self.track_id_aliases[raw_track_id] = canonical_id
+                                                self.seen_track_ids.add(raw_track_id)
+                                                self.seen_track_ids.add(canonical_id)
+
+                                                if best_match_id in self.lost_tracks:
+                                                    del self.lost_tracks[best_match_id]
+
+                                                self.log_message_signal.emit(
+                                                    f"Counter: Reappeared {label} detected (ID: {raw_track_id} matched lost ID: {best_match_id}, dist: {best_dist_cm:.1f} cm). Count unchanged."
+                                                )
+                                            else:
+                                                self.seen_track_ids.add(raw_track_id)
+                                                self.object_counts[label] = self.object_counts.get(label, 0) + 1
+                                                self.log_message_signal.emit(
+                                                    f"Counter: New {label} detected (ID: {raw_track_id}). Total {label}: {self.object_counts[label]}"
+                                                )
+                                                new_count_detected = True
+
+                                        if canonical_id not in self.active_tracks:
+                                            self.active_tracks[canonical_id] = []
+                                        self.active_tracks[canonical_id].append({
+                                            't': t_now,
+                                            'pos_3d': pos_3d,
+                                            'pos_2d': pos_2d,
+                                            'label': label
+                                        })
+                                        self.active_tracks[canonical_id] = [
+                                            rec for rec in self.active_tracks[canonical_id]
+                                            if (t_now - rec['t']) <= 1.0
+                                        ]
+                                        current_frame_canonical_ids.add(canonical_id)
+
                                     detections_list.append({
                                         'box_xyxyn': box_normalized,
                                         'confidence': confidence,
                                         'class_id': class_id,
                                         'label': label
                                     })
+
+                            # Fehlende Tracks in lost_tracks verschieben
+                            for active_id in list(self.active_tracks.keys()):
+                                if active_id not in current_frame_canonical_ids:
+                                    hist = self.active_tracks[active_id]
+                                    if hist:
+                                        v3d, v2d = self._calc_velocity(hist)
+                                        last_rec = hist[-1]
+                                        self.lost_tracks[active_id] = {
+                                            'last_t': last_rec['t'],
+                                            'last_pos_3d': last_rec['pos_3d'],
+                                            'v_3d': v3d,
+                                            'last_pos_2d': last_rec['pos_2d'],
+                                            'v_2d': v2d,
+                                            'label': last_rec['label'],
+                                            'canonical_id': active_id
+                                        }
+                                    del self.active_tracks[active_id]
 
                             if new_count_detected:
                                 self.new_counts_signal.emit(self.object_counts.copy())
@@ -329,10 +505,8 @@ class ZedCameraHandler(QThread):
                     qt_image = QImage(image_for_qt, w, h, ch * w, QImage.Format_RGB888).copy()
                     self.new_image_signal.emit(QPixmap.fromImage(qt_image))
 
-                # Tiefenkarte
+                # Tiefenkarte Bildanzeige
                 if self.init_params.depth_mode != sl.DEPTH_MODE.NONE:
-                    self.zed.retrieve_measure(depth_map_sl, sl.MEASURE.DEPTH)
-                    depth_map_ocv = depth_map_sl.get_data()
                     if depth_map_ocv is not None and depth_map_ocv.size > 0:
                         depth_display = np.nan_to_num(depth_map_ocv, nan=0.0, posinf=0.0, neginf=0.0)
                         min_val, max_val = np.min(depth_display), np.max(depth_display)
@@ -367,6 +541,9 @@ class ZedCameraHandler(QThread):
     def reset_counter(self):
         self.object_counts = {}
         self.seen_track_ids = set()
+        self.active_tracks = {}
+        self.lost_tracks = {}
+        self.track_id_aliases = {}
         self.new_counts_signal.emit(self.object_counts.copy())
 
 
@@ -405,7 +582,9 @@ class ZedAppGUI(QMainWindow):
         self.show_boxes = True
         self.show_labels = True
 
-        # Counter
+        # Counter settings
+        self.retention_time_sec = 3.0
+        self.distance_threshold_cm = 30.0
         self.object_counts = {}
 
         # ── UI ───────────────────────────────────────────────────────────────
@@ -525,9 +704,45 @@ class ZedAppGUI(QMainWindow):
         counter_layout = QVBoxLayout()
         self.counter_label = QLabel("No items detected yet.")
         self.counter_label.setStyleSheet("font-size: 14px; font-weight: bold;")
+
+        # Retention window slider
+        retention_layout = QVBoxLayout()
+        retention_label_row = QHBoxLayout()
+        retention_label_row.addWidget(QLabel("Retention Window:"))
+        self.retention_val_label = QLabel(f"{self.retention_time_sec:.1f} s")
+        retention_label_row.addWidget(self.retention_val_label)
+
+        self.retention_slider = QSlider(Qt.Horizontal)
+        self.retention_slider.setMinimum(5)   # 0.5 s
+        self.retention_slider.setMaximum(100) # 10.0 s
+        self.retention_slider.setValue(int(self.retention_time_sec * 10))
+        self.retention_slider.valueChanged.connect(self.update_retention_time)
+
+        retention_layout.addLayout(retention_label_row)
+        retention_layout.addWidget(self.retention_slider)
+
+        # Distance threshold slider
+        distance_layout = QVBoxLayout()
+        distance_label_row = QHBoxLayout()
+        distance_label_row.addWidget(QLabel("Reappearance Dist:"))
+        self.distance_val_label = QLabel(f"{self.distance_threshold_cm:.0f} cm")
+        distance_label_row.addWidget(self.distance_val_label)
+
+        self.distance_slider = QSlider(Qt.Horizontal)
+        self.distance_slider.setMinimum(5)    # 5 cm
+        self.distance_slider.setMaximum(200)  # 200 cm
+        self.distance_slider.setValue(int(self.distance_threshold_cm))
+        self.distance_slider.valueChanged.connect(self.update_distance_threshold)
+
+        distance_layout.addLayout(distance_label_row)
+        distance_layout.addWidget(self.distance_slider)
+
         self.reset_counter_button = QPushButton("Reset Counter")
         self.reset_counter_button.clicked.connect(self.reset_counter)
+
         counter_layout.addWidget(self.counter_label)
+        counter_layout.addLayout(retention_layout)
+        counter_layout.addLayout(distance_layout)
         counter_layout.addWidget(self.reset_counter_button)
         counter_group.setLayout(counter_layout)
         left_panel_layout.addWidget(counter_group)
@@ -665,6 +880,18 @@ class ZedAppGUI(QMainWindow):
             self.last_depth_pixmap.save(depth_filepath, "PNG")
             self.log_message(f"GUI: Depth map saved to {depth_filepath}")
 
+    def update_retention_time(self, value):
+        self.retention_time_sec = value / 10.0
+        self.retention_val_label.setText(f"{self.retention_time_sec:.1f} s")
+        if self.camera_handler:
+            self.camera_handler.update_retention_time(self.retention_time_sec)
+
+    def update_distance_threshold(self, value):
+        self.distance_threshold_cm = float(value)
+        self.distance_val_label.setText(f"{self.distance_threshold_cm:.0f} cm")
+        if self.camera_handler:
+            self.camera_handler.update_distance_threshold(self.distance_threshold_cm)
+
     def reset_counter(self):
         self.object_counts = {}
         self.counter_label.setText("No items detected yet.")
@@ -731,6 +958,8 @@ class ZedAppGUI(QMainWindow):
 
         self.camera_handler = ZedCameraHandler(self, model_path=self.model_path)
         self.camera_handler.conf_threshold = self.conf_threshold
+        self.camera_handler.retention_time_sec = self.retention_time_sec
+        self.camera_handler.distance_threshold_cm = self.distance_threshold_cm
         self.camera_handler.new_image_signal.connect(self.update_image_label)
         self.camera_handler.new_depth_signal.connect(self.update_depth_label)
         self.camera_handler.log_message_signal.connect(self.log_message)
